@@ -1,0 +1,32 @@
+# Vendor study repos (cloned for architecture research)
+vendor-study/
+
+# Dependencies
+node_modules/
+.pnpm-store/
+__pycache__/
+*.pyc
+.venv/
+.uv/
+
+# Build output
+dist/
+build/
+.next/
+*.wasm
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+pgdata/

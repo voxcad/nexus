@@ -1,0 +1,244 @@
+// NEXUS — Universal Spatial Entity Schema (USES)
+// FlatBuffers binary wire format for high-frequency geometry updates
+// Used by: Headless Geometry API, Agent Communication Protocol, CRDT sync
+
+namespace nexus.schema;
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum EntityDomain : byte {
+  BIM = 0,
+  GIS = 1,
+  CAD = 2,
+  Civil = 3,
+  Survey = 4,
+  PointCloud = 5,
+  Construction = 6
+}
+
+enum GeometryType : byte {
+  BRep = 0,
+  Mesh = 1,
+  PointCloud = 2,
+  Parametric = 3
+}
+
+enum ApprovalStatus : byte {
+  Draft = 0,
+  Proposed = 1,
+  Approved = 2,
+  Archived = 3
+}
+
+enum Phase : byte {
+  Design = 0,
+  Planned = 1,
+  AsBuilt = 2,
+  AsInspected = 3,
+  Demolished = 4
+}
+
+enum RelationType : byte {
+  Contains = 0,
+  ContainedBy = 1,
+  AdjacentTo = 2,
+  Intersects = 3,
+  References = 4,
+  DerivedFrom = 5,
+  ClashesWith = 6,
+  DependsOn = 7
+}
+
+enum AnnotationType : byte {
+  Classification = 0,
+  ComplianceCheck = 1,
+  CostEstimate = 2,
+  ClashDetection = 3,
+  DesignSuggestion = 4,
+  DeviationAlert = 5,
+  RiskFlag = 6
+}
+
+// ---------------------------------------------------------------------------
+// Geometry
+// ---------------------------------------------------------------------------
+
+struct Vec3 {
+  x: float64;
+  y: float64;
+  z: float64;
+}
+
+struct AABB {
+  min: Vec3;
+  max: Vec3;
+}
+
+struct Mat4x4 {
+  m00: float64; m01: float64; m02: float64; m03: float64;
+  m10: float64; m11: float64; m12: float64; m13: float64;
+  m20: float64; m21: float64; m22: float64; m23: float64;
+  m30: float64; m31: float64; m32: float64; m33: float64;
+}
+
+table MeshData {
+  vertices: [float32];     // x,y,z interleaved
+  indices: [uint32];
+  normals: [float32];      // optional
+  vertex_count: uint32;
+  triangle_count: uint32;
+  lod: uint8;
+  bounding_box: AABB;
+}
+
+table BRepData {
+  format: string;          // 'occt_brep' | 'step'
+  data: [uint8];           // serialized B-Rep binary
+  bounding_box: AABB;
+}
+
+table PointCloudData {
+  format: string;          // 'copc' | 'laz'
+  data: [uint8];
+  point_count: uint64;
+  octree_depth: uint8;
+  classifications: [uint8];
+  bounding_box: AABB;
+}
+
+table ParametricData {
+  schema: string;
+  parameters_json: string; // JSON-encoded parameters
+}
+
+union GeometryUnion {
+  MeshData,
+  BRepData,
+  PointCloudData,
+  ParametricData
+}
+
+table GeometryRep {
+  type: GeometryType;
+  geometry: GeometryUnion;
+}
+
+// ---------------------------------------------------------------------------
+// Properties
+// ---------------------------------------------------------------------------
+
+table PropertyValue {
+  key: string;
+  string_val: string;
+  real_val: float64;
+  int_val: int64;
+  bool_val: bool;
+  unit: string;
+  confidence: float32;    // 0..1, 1.0 = certain
+}
+
+table PropertySet {
+  name: string;
+  source_type: string;    // 'ifc_pset', 'gis_attribute', etc.
+  properties: [PropertyValue];
+}
+
+// ---------------------------------------------------------------------------
+// AI Annotations
+// ---------------------------------------------------------------------------
+
+table AIAnnotation {
+  agent_id: string;
+  timestamp: uint64;
+  annotation_type: AnnotationType;
+  label: string;
+  confidence: float32;
+  reasoning: string;
+  related_entity_ids: [string];
+}
+
+// ---------------------------------------------------------------------------
+// Lineage
+// ---------------------------------------------------------------------------
+
+table TransformationStep {
+  operation: string;
+  tool: string;
+  input_hash: string;     // SHA-256
+  output_hash: string;
+  timestamp: uint64;
+}
+
+table Lineage {
+  created_by: string;
+  created_at: uint64;
+  source_format: string;
+  source_file: string;
+  transformation_chain: [TransformationStep];
+  parent_entity_ids: [string];
+  approval_status: ApprovalStatus;
+  approved_by: string;
+}
+
+// ---------------------------------------------------------------------------
+// Coordinate Reference
+// ---------------------------------------------------------------------------
+
+table CoordinateRef {
+  crs: string;             // EPSG code or WKT2
+  local_to_crs: Mat4x4;
+  floating_origin: Vec3;
+  vertical_datum: string;
+  geoid_separation: float64;
+}
+
+// ---------------------------------------------------------------------------
+// Relations
+// ---------------------------------------------------------------------------
+
+table EntityRelation {
+  type: RelationType;
+  target_id: string;
+}
+
+// ---------------------------------------------------------------------------
+// Root Entity
+// ---------------------------------------------------------------------------
+
+table SpatialEntity {
+  id: string;
+  project_id: string;
+  entity_type: string;     // e.g., 'bim.wall', 'civil.alignment'
+  domain: EntityDomain;
+
+  geometry: [GeometryRep];
+  coordinate_ref: CoordinateRef;
+  property_sets: [PropertySet];
+  ai_annotations: [AIAnnotation];
+  lineage: Lineage;
+
+  version: uint32;
+  valid_from: uint64;
+  valid_to: uint64;        // 0 = current
+  phase: Phase;
+
+  layers: [string];
+  tags: [string];
+  relations: [EntityRelation];
+}
+
+// ---------------------------------------------------------------------------
+// Batch (root type for streaming entity updates)
+// ---------------------------------------------------------------------------
+
+table EntityBatch {
+  timestamp: uint64;
+  source: string;          // agent_id or 'user' or 'sync'
+  entities: [SpatialEntity];
+  deleted_ids: [string];   // entities removed in this batch
+  sequence_number: uint64; // monotonic for ordering
+}
+
+root_type EntityBatch;
