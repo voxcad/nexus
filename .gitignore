@@ -1,6 +1,9 @@
 # Vendor study repos (cloned for architecture research)
 vendor-study/
 
+# Skyforge has its own repo (voxcad/skyforge)
+skyforge/
+
 # Dependencies
 node_modules/
 .pnpm-store/
