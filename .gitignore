@@ -14,6 +14,12 @@ dist/
 build/
 .next/
 *.wasm
+packages/kernel/pkg/
+packages/kernel/target/
+packages/app/.svelte-kit/
+
+# Lock files tracked separately
+pnpm-lock.yaml
 
 # Environment
 .env

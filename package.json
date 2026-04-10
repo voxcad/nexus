@@ -1,0 +1,16 @@
+{
+  "name": "nexus",
+  "private": true,
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev --filter=@nexus/app",
+    "test": "turbo test",
+    "build:kernel": "cd packages/kernel && wasm-pack build --target web --out-dir pkg",
+    "lint": "turbo lint"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0",
+    "typescript": "^5.5.0"
+  }
+}
