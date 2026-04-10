@@ -1,0 +1,4 @@
+
+> @nexus/file-io@0.1.0 build /Users/bm/cod/current/cad/packages/file-io
+> tsc --noEmit
+

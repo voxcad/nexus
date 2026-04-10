@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { CadRenderer } from '@nexus/renderer';
   import PropertiesPanel from '$lib/PropertiesPanel.svelte';
+  import FileMenu from '$lib/FileMenu.svelte';
 
   type Tool = 'select' | 'line' | 'circle' | 'rectangle' | 'arc' | 'move' | 'copy' | 'rotate';
 
@@ -21,6 +22,9 @@
   let drawStep = $state(0);
   let firstPoint = $state<{x: number; y: number} | null>(null);
   let selectedEntity = $state<any>(null);
+  let projectName = $state('untitled');
+  let autoSaveStatus = $state('');
+  let autoSaveTimer: ReturnType<typeof setInterval> | null = null;
 
   let kernel: any = null;
   let renderer: CadRenderer | null = null;
@@ -385,6 +389,7 @@
     else if (e.key === 'z' && (e.ctrlKey || e.metaKey) && e.shiftKey) { e.preventDefault(); doRedo(); }
     else if (e.key === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doUndo(); }
     else if (e.key === 'y' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doRedo(); }
+    else if (e.key === 's' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); handleSave(); }
     else if (e.key === 'Delete' || e.key === 'Backspace') { doDelete(); }
     else if (e.key === 'l') setTool('line');
     else if (e.key === 'c') setTool('circle');
@@ -398,6 +403,106 @@
 
   function handlePropertyUpdate(id: string, changes: any) {
     // Future: update entity properties via kernel
+  }
+
+  async function handleNew() {
+    if (kernel) {
+      const wasmModule = await import('@nexus/kernel');
+      kernel = new wasmModule.Kernel();
+      renderer?.selectionManager.clear();
+      selectedEntity = null;
+      projectName = 'untitled';
+      syncView();
+      statusText = 'New project created';
+    }
+  }
+
+  async function handleOpen() {
+    try {
+      const { openFilePicker, deserializeProject, parseDxf } = await import('@nexus/file-io');
+      const file = await openFilePicker('.dxf,.nexus,.json');
+      if (!file || !kernel) return;
+
+      if (file.name.endsWith('.nexus') || file.name.endsWith('.json')) {
+        const project = deserializeProject(file.content);
+        if (project) {
+          const wasmModule = await import('@nexus/kernel');
+          kernel = new wasmModule.Kernel();
+          for (const ent of project.entities) {
+            const g = ent.geometry;
+            if (g.Line) kernel.create_line(g.Line.start.x, g.Line.start.y, g.Line.end.x, g.Line.end.y, ent.layer_id || 'default');
+            else if (g.Circle) kernel.create_circle(g.Circle.center.x, g.Circle.center.y, g.Circle.radius, ent.layer_id || 'default');
+            else if (g.Arc) kernel.create_arc(g.Arc.center.x, g.Arc.center.y, g.Arc.radius, g.Arc.start_angle, g.Arc.end_angle, ent.layer_id || 'default');
+            else if (g.Rectangle) kernel.create_rectangle(g.Rectangle.origin.x, g.Rectangle.origin.y, g.Rectangle.width, g.Rectangle.height, ent.layer_id || 'default');
+          }
+          projectName = file.name.replace(/\.(nexus|json)$/, '');
+          syncView();
+          renderer?.zoomExtents();
+          statusText = `Opened: ${file.name}`;
+        }
+      } else if (file.name.endsWith('.dxf')) {
+        const imported = parseDxf(file.content);
+        const wasmModule = await import('@nexus/kernel');
+        kernel = new wasmModule.Kernel();
+        for (const ent of imported) {
+          const g = ent.geometry;
+          if (g.Line) kernel.create_line(g.Line.start.x, g.Line.start.y, g.Line.end.x, g.Line.end.y, ent.layer || 'default');
+          else if (g.Circle) kernel.create_circle(g.Circle.center.x, g.Circle.center.y, g.Circle.radius, ent.layer || 'default');
+          else if (g.Arc) kernel.create_arc(g.Arc.center.x, g.Arc.center.y, g.Arc.radius, g.Arc.start_angle, g.Arc.end_angle, ent.layer || 'default');
+          else if (g.Polyline) {
+            const coords = g.Polyline.vertices.flatMap((v: any) => [v.x, v.y]);
+            kernel.create_polyline(JSON.stringify(coords), g.Polyline.closed, ent.layer || 'default');
+          }
+        }
+        projectName = file.name.replace('.dxf', '');
+        syncView();
+        renderer?.zoomExtents();
+        statusText = `Imported DXF: ${imported.length} entities from ${file.name}`;
+      }
+    } catch (e) {
+      statusText = `Open failed: ${e}`;
+    }
+  }
+
+  async function handleSave() {
+    if (!kernel) return;
+    try {
+      const { saveProject, serializeProject } = await import('@nexus/file-io');
+      const data = serializeProject(
+        kernel.get_entities_json(),
+        kernel.get_constraints_json(),
+        { name: projectName }
+      );
+      await saveProject(projectName, data);
+      autoSaveStatus = `Saved ${new Date().toLocaleTimeString()}`;
+      statusText = `Saved: ${projectName}`;
+    } catch (e) {
+      statusText = `Save failed: ${e}`;
+    }
+  }
+
+  async function handleSaveAs() {
+    const name = prompt('Project name:', projectName);
+    if (name) {
+      projectName = name;
+      await handleSave();
+    }
+  }
+
+  async function handleExportDxf() {
+    if (!kernel) return;
+    try {
+      const { exportDxf, downloadFile } = await import('@nexus/file-io');
+      const dxf = exportDxf(kernel.get_entities_json());
+      downloadFile(dxf, `${projectName}.dxf`, 'application/dxf');
+      statusText = `Exported: ${projectName}.dxf`;
+    } catch (e) {
+      statusText = `Export failed: ${e}`;
+    }
+  }
+
+  async function handleImportDxf() {
+    await handleOpen();
   }
 
   onMount(async () => {
@@ -420,12 +525,23 @@
       kernel.create_circle(0, 0, 5, 'default');
       syncView();
       renderer.zoomExtents();
+
+      // Auto-save every 30 seconds
+      autoSaveTimer = setInterval(async () => {
+        if (kernel && kernel.entity_count() > 0) {
+          await handleSave();
+          autoSaveStatus = `Auto-saved ${new Date().toLocaleTimeString()}`;
+        }
+      }, 30000);
     } catch (e) {
       statusText = `Init error: ${e}`;
       console.error(e);
     }
 
-    return () => renderer?.dispose();
+    return () => {
+      renderer?.dispose();
+      if (autoSaveTimer) clearInterval(autoSaveTimer);
+    };
   });
 </script>
 
@@ -434,6 +550,17 @@
 <div class="app">
   <header class="toolbar">
     <span class="logo">NEXUS</span>
+
+    <FileMenu
+      {projectName}
+      {autoSaveStatus}
+      onNew={handleNew}
+      onOpen={handleOpen}
+      onSave={handleSave}
+      onSaveAs={handleSaveAs}
+      onExportDxf={handleExportDxf}
+      onImportDxf={handleImportDxf}
+    />
 
     <div class="tool-group">
       <button class:active={currentTool === 'select'} onclick={() => setTool('select')} title="Select (S)">Select</button>
@@ -447,6 +574,15 @@
       <button class:active={currentTool === 'copy'} onclick={() => setTool('copy')} title="Copy (CO)">Copy</button>
       <button class:active={currentTool === 'rotate'} onclick={() => setTool('rotate')} title="Rotate (RO)">Rotate</button>
       <button onclick={doDelete} title="Delete (Del)">Delete</button>
+      <span class="separator">|</span>
+      <button onclick={() => { if (kernel && renderer) {
+        const ids = renderer.selectionManager.getSelectedIds();
+        if (ids.length === 1) { kernel.add_constraint_horizontal(ids[0]); syncView(); statusText = 'Added horizontal constraint'; }
+      }}} title="Horizontal Constraint (H)">H&#x27F7;</button>
+      <button onclick={() => { if (kernel && renderer) {
+        const ids = renderer.selectionManager.getSelectedIds();
+        if (ids.length === 1) { kernel.add_constraint_vertical(ids[0]); syncView(); statusText = 'Added vertical constraint'; }
+      }}} title="Vertical Constraint (V)">V&#x2195;</button>
     </div>
 
     <span class="separator">|</span>
@@ -481,6 +617,9 @@
       />
     </div>
     <span class="status-text">{statusText}</span>
+    {#if autoSaveStatus}
+      <span class="autosave-text">{autoSaveStatus}</span>
+    {/if}
     <div class="coordinates">
       {#if hasSnap && snapType !== 'grid'}
         <span class="snap-indicator">[{snapType}]</span>
@@ -617,5 +756,10 @@
   .coord-value {
     color: #00ff88;
     font-family: 'JetBrains Mono', monospace;
+  }
+
+  .autosave-text {
+    color: #555;
+    font-size: 0.7rem;
   }
 </style>

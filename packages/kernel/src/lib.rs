@@ -1,3 +1,4 @@
+mod constraints;
 mod entity;
 mod events;
 
@@ -19,6 +20,7 @@ macro_rules! console_log {
 pub struct Kernel {
     entities: Vec<Entity>,
     event_store: EventStore,
+    constraint_solver: constraints::ConstraintSolver,
     next_id: u64,
 }
 
@@ -29,6 +31,7 @@ impl Kernel {
         Kernel {
             entities: Vec::new(),
             event_store: EventStore::new(),
+            constraint_solver: constraints::ConstraintSolver::new(),
             next_id: 1,
         }
     }
@@ -143,6 +146,7 @@ impl Kernel {
             let entity = self.entities.remove(pos);
             self.event_store
                 .push(CadEvent::EntityDeleted { entity });
+            self.constraint_solver.remove_constraints_for_entity(id);
             true
         } else {
             false
@@ -159,6 +163,7 @@ impl Kernel {
                 dy,
                 old_geometry,
             });
+            self.constraint_solver.solve(&mut self.entities);
             true
         } else {
             false
@@ -176,6 +181,7 @@ impl Kernel {
                 angle,
                 old_geometry,
             });
+            self.constraint_solver.solve(&mut self.entities);
             true
         } else {
             false
@@ -193,6 +199,7 @@ impl Kernel {
                 factor,
                 old_geometry,
             });
+            self.constraint_solver.solve(&mut self.entities);
             true
         } else {
             false
@@ -308,6 +315,97 @@ impl Kernel {
 
     pub fn event_count(&self) -> usize {
         self.event_store.event_count()
+    }
+
+    // --- Constraints ---
+
+    pub fn add_constraint_horizontal(&mut self, entity_id: &str) -> String {
+        let id = self.constraint_solver.add_constraint(
+            constraints::ConstraintType::Horizontal { entity_id: entity_id.to_string() }
+        );
+        self.constraint_solver.solve(&mut self.entities);
+        id
+    }
+
+    pub fn add_constraint_vertical(&mut self, entity_id: &str) -> String {
+        let id = self.constraint_solver.add_constraint(
+            constraints::ConstraintType::Vertical { entity_id: entity_id.to_string() }
+        );
+        self.constraint_solver.solve(&mut self.entities);
+        id
+    }
+
+    pub fn add_constraint_coincident(&mut self, entity_a: &str, point_a: usize, entity_b: &str, point_b: usize) -> String {
+        let id = self.constraint_solver.add_constraint(
+            constraints::ConstraintType::Coincident {
+                entity_a: entity_a.to_string(), point_a,
+                entity_b: entity_b.to_string(), point_b,
+            }
+        );
+        self.constraint_solver.solve(&mut self.entities);
+        id
+    }
+
+    pub fn add_constraint_distance(&mut self, entity_a: &str, point_a: usize, entity_b: &str, point_b: usize, distance: f64) -> String {
+        let id = self.constraint_solver.add_constraint(
+            constraints::ConstraintType::Distance {
+                entity_a: entity_a.to_string(), point_a,
+                entity_b: entity_b.to_string(), point_b,
+                distance,
+            }
+        );
+        self.constraint_solver.solve(&mut self.entities);
+        id
+    }
+
+    pub fn add_constraint_fixed(&mut self, entity_id: &str, point_index: usize, x: f64, y: f64) -> String {
+        let id = self.constraint_solver.add_constraint(
+            constraints::ConstraintType::Fixed {
+                entity_id: entity_id.to_string(),
+                point_index,
+                position: entity::Point2D::new(x, y),
+            }
+        );
+        self.constraint_solver.solve(&mut self.entities);
+        id
+    }
+
+    pub fn add_constraint_parallel(&mut self, entity_a: &str, entity_b: &str) -> String {
+        let id = self.constraint_solver.add_constraint(
+            constraints::ConstraintType::Parallel {
+                entity_a: entity_a.to_string(),
+                entity_b: entity_b.to_string(),
+            }
+        );
+        self.constraint_solver.solve(&mut self.entities);
+        id
+    }
+
+    pub fn add_constraint_perpendicular(&mut self, entity_a: &str, entity_b: &str) -> String {
+        let id = self.constraint_solver.add_constraint(
+            constraints::ConstraintType::Perpendicular {
+                entity_a: entity_a.to_string(),
+                entity_b: entity_b.to_string(),
+            }
+        );
+        self.constraint_solver.solve(&mut self.entities);
+        id
+    }
+
+    pub fn remove_constraint(&mut self, id: &str) -> bool {
+        self.constraint_solver.remove_constraint(id)
+    }
+
+    pub fn get_constraints_json(&self) -> String {
+        self.constraint_solver.get_constraints_json()
+    }
+
+    pub fn constraint_count(&self) -> usize {
+        self.constraint_solver.constraint_count()
+    }
+
+    pub fn solve_constraints(&mut self) -> bool {
+        self.constraint_solver.solve(&mut self.entities)
     }
 
     // --- Query ---
@@ -453,5 +551,47 @@ mod tests {
         let id = k.create_line(0.0, 0.0, 10.0, 10.0, "default");
         assert!(k.delete_entity(&id));
         assert_eq!(k.entity_count(), 0);
+    }
+
+    #[test]
+    fn test_horizontal_constraint() {
+        let mut k = Kernel::new();
+        let id = k.create_line(0.0, 0.0, 10.0, 5.0, "default");
+        k.add_constraint_horizontal(&id);
+        let json = k.get_entity_json(&id);
+        let entity: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let start_y = entity["geometry"]["Line"]["start"]["y"].as_f64().unwrap();
+        let end_y = entity["geometry"]["Line"]["end"]["y"].as_f64().unwrap();
+        assert!((start_y - end_y).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_vertical_constraint() {
+        let mut k = Kernel::new();
+        let id = k.create_line(0.0, 0.0, 5.0, 10.0, "default");
+        k.add_constraint_vertical(&id);
+        let json = k.get_entity_json(&id);
+        let entity: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let start_x = entity["geometry"]["Line"]["start"]["x"].as_f64().unwrap();
+        let end_x = entity["geometry"]["Line"]["end"]["x"].as_f64().unwrap();
+        assert!((start_x - end_x).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_constraint_count() {
+        let mut k = Kernel::new();
+        let id = k.create_line(0.0, 0.0, 10.0, 5.0, "default");
+        k.add_constraint_horizontal(&id);
+        assert_eq!(k.constraint_count(), 1);
+    }
+
+    #[test]
+    fn test_delete_entity_removes_constraints() {
+        let mut k = Kernel::new();
+        let id = k.create_line(0.0, 0.0, 10.0, 5.0, "default");
+        k.add_constraint_horizontal(&id);
+        assert_eq!(k.constraint_count(), 1);
+        k.delete_entity(&id);
+        assert_eq!(k.constraint_count(), 0);
     }
 }
