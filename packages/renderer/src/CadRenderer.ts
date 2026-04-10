@@ -1,4 +1,6 @@
 import * as THREE from 'three';
+import { SnapEngine, type SnapPoint } from './SnapEngine.js';
+import { SelectionManager } from './SelectionManager.js';
 
 export interface RenderableEntity {
   id: string;
@@ -29,6 +31,12 @@ export class CadRenderer {
   public onCursorMove?: (x: number, y: number) => void;
   public onClick?: (worldX: number, worldY: number) => void;
 
+  public snapEngine: SnapEngine;
+  public selectionManager: SelectionManager;
+  private previewObject: THREE.Object3D | null = null;
+  private snapIndicator: THREE.Mesh | null = null;
+  private cachedEntities: any[] = [];
+
   constructor(container: HTMLElement) {
     this.container = container;
     this.width = container.clientWidth;
@@ -36,6 +44,9 @@ export class CadRenderer {
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x1a1a2e);
+
+    this.snapEngine = new SnapEngine();
+    this.selectionManager = new SelectionManager(this.scene);
 
     const aspect = this.width / this.height;
     this.camera = new THREE.OrthographicCamera(
@@ -210,6 +221,8 @@ export class CadRenderer {
       return;
     }
 
+    this.cachedEntities = entities;
+
     for (const [_id, obj] of this.entityMeshes) {
       this.scene.remove(obj);
     }
@@ -280,6 +293,7 @@ export class CadRenderer {
       }
     }
 
+    this.updateSelection();
     this.render();
   }
 
@@ -308,7 +322,120 @@ export class CadRenderer {
     this.renderer.render(this.scene, this.camera);
   }
 
+  public getEntitiesForSnap(): any[] {
+    return this.cachedEntities;
+  }
+
+  public hitTest(worldX: number, worldY: number): string | null {
+    const threshold = this.zoom * 0.02;
+    return this.selectionManager.hitTest(worldX, worldY, this.entityMeshes, threshold);
+  }
+
+  public updateSelection() {
+    this.selectionManager.updateVisuals(this.entityMeshes, this.cachedEntities, this.zoom);
+    this.render();
+  }
+
+  public setPreview(type: 'line' | 'circle' | 'rectangle', firstPoint: { x: number; y: number }, cursorPoint: { x: number; y: number }) {
+    this.clearPreviewObject();
+
+    const dashColor = new THREE.Color(0xffff00);
+    const material = new THREE.LineDashedMaterial({
+      color: dashColor,
+      dashSize: this.zoom * 0.01,
+      gapSize: this.zoom * 0.005,
+    });
+
+    let geo: THREE.BufferGeometry | null = null;
+
+    if (type === 'line') {
+      geo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(firstPoint.x, firstPoint.y, 0.3),
+        new THREE.Vector3(cursorPoint.x, cursorPoint.y, 0.3),
+      ]);
+    } else if (type === 'circle') {
+      const dx = cursorPoint.x - firstPoint.x;
+      const dy = cursorPoint.y - firstPoint.y;
+      const radius = Math.sqrt(dx * dx + dy * dy);
+      const curve = new THREE.EllipseCurve(firstPoint.x, firstPoint.y, radius, radius, 0, Math.PI * 2, false, 0);
+      const pts = curve.getPoints(64);
+      geo = new THREE.BufferGeometry().setFromPoints(pts.map(p => new THREE.Vector3(p.x, p.y, 0.3)));
+    } else if (type === 'rectangle') {
+      const pts = [
+        new THREE.Vector3(firstPoint.x, firstPoint.y, 0.3),
+        new THREE.Vector3(cursorPoint.x, firstPoint.y, 0.3),
+        new THREE.Vector3(cursorPoint.x, cursorPoint.y, 0.3),
+        new THREE.Vector3(firstPoint.x, cursorPoint.y, 0.3),
+        new THREE.Vector3(firstPoint.x, firstPoint.y, 0.3),
+      ];
+      geo = new THREE.BufferGeometry().setFromPoints(pts);
+    }
+
+    if (geo) {
+      const line = new THREE.Line(geo, material);
+      line.computeLineDistances();
+      this.previewObject = line;
+      this.scene.add(line);
+      this.render();
+    }
+  }
+
+  public setSnapIndicator(snapPoint: SnapPoint | null) {
+    this.clearSnapIndicator();
+
+    if (!snapPoint) return;
+
+    const size = this.zoom * 0.008;
+    const shape = new THREE.Shape();
+    // Diamond shape
+    shape.moveTo(0, size);
+    shape.lineTo(size, 0);
+    shape.lineTo(0, -size);
+    shape.lineTo(-size, 0);
+    shape.closePath();
+
+    const geo = new THREE.ShapeGeometry(shape);
+    const colorMap: Record<string, number> = {
+      endpoint: 0x00ff00,
+      midpoint: 0x00ffff,
+      center: 0xff00ff,
+      intersection: 0xffff00,
+      grid: 0x888888,
+      nearest: 0xff8800,
+    };
+    const mat = new THREE.MeshBasicMaterial({
+      color: colorMap[snapPoint.type] ?? 0x00ff00,
+    });
+
+    this.snapIndicator = new THREE.Mesh(geo, mat);
+    this.snapIndicator.position.set(snapPoint.x, snapPoint.y, 0.5);
+    this.scene.add(this.snapIndicator);
+    this.render();
+  }
+
+  public clearPreview() {
+    this.clearPreviewObject();
+    this.clearSnapIndicator();
+    this.render();
+  }
+
+  private clearPreviewObject() {
+    if (this.previewObject) {
+      this.scene.remove(this.previewObject);
+      this.previewObject = null;
+    }
+  }
+
+  private clearSnapIndicator() {
+    if (this.snapIndicator) {
+      this.scene.remove(this.snapIndicator);
+      this.snapIndicator = null;
+    }
+  }
+
   public dispose() {
+    this.selectionManager.clearVisuals();
+    this.clearPreview();
     this.renderer.dispose();
     this.renderer.domElement.remove();
   }

@@ -1,25 +1,33 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { CadRenderer } from '@nexus/renderer';
+  import PropertiesPanel from '$lib/PropertiesPanel.svelte';
 
-  // Tool state
-  type Tool = 'select' | 'line' | 'circle' | 'rectangle';
-  let currentTool = $state<Tool>('line');
+  type Tool = 'select' | 'line' | 'circle' | 'rectangle' | 'arc' | 'move' | 'copy' | 'rotate';
+
+  let currentTool = $state<Tool>('select');
   let cursorX = $state(0);
   let cursorY = $state(0);
+  let snapX = $state(0);
+  let snapY = $state(0);
+  let hasSnap = $state(false);
+  let snapType = $state('');
   let entityCount = $state(0);
   let statusText = $state('Ready');
+  let snapEnabled = $state(true);
+  let canUndo = $state(false);
+  let canRedo = $state(false);
 
-  // Drawing state machine
-  let drawStep = $state(0); // 0 = waiting for first click, 1 = waiting for second click
+  let drawStep = $state(0);
   let firstPoint = $state<{x: number; y: number} | null>(null);
+  let selectedEntity = $state<any>(null);
 
-  // Kernel + renderer refs
   let kernel: any = null;
   let renderer: CadRenderer | null = null;
   let canvasContainer: HTMLElement;
   let commandInput: HTMLInputElement;
   let commandText = $state('');
+  let lastPoint = $state<{x: number; y: number}>({ x: 0, y: 0 });
 
   const layerColors = new Map([['default', '#00ff88']]);
 
@@ -28,39 +36,64 @@
     const json = kernel.get_entities_json();
     renderer.syncEntities(json, layerColors);
     entityCount = kernel.entity_count();
+    canUndo = kernel.can_undo();
+    canRedo = kernel.can_redo();
+
+    if (renderer.selectionManager && renderer.selectionManager.selectedIds.size > 0) {
+      renderer.updateSelection();
+    }
+    renderer.render();
+  }
+
+  function getSnapOrCursor(): { x: number; y: number } {
+    return hasSnap ? { x: snapX, y: snapY } : { x: cursorX, y: cursorY };
   }
 
   function handleClick(worldX: number, worldY: number) {
-    if (!kernel) return;
+    if (!kernel || !renderer) return;
 
-    // Snap to grid (1 unit)
-    const snap = 1;
-    const sx = Math.round(worldX / snap) * snap;
-    const sy = Math.round(worldY / snap) * snap;
+    const pt = getSnapOrCursor();
+
+    if (currentTool === 'select') {
+      const hitId = renderer.hitTest(worldX, worldY);
+      renderer.selectionManager.clear();
+      if (hitId) {
+        renderer.selectionManager.select(hitId);
+        const json = kernel.get_entity_json(hitId);
+        selectedEntity = json ? JSON.parse(json) : null;
+        statusText = `Selected: ${hitId}`;
+      } else {
+        selectedEntity = null;
+        statusText = 'Select: click to select entities';
+      }
+      renderer.updateSelection();
+      renderer.render();
+      return;
+    }
 
     if (currentTool === 'line') {
       if (drawStep === 0) {
-        firstPoint = { x: sx, y: sy };
+        firstPoint = { x: pt.x, y: pt.y };
+        lastPoint = { x: pt.x, y: pt.y };
         drawStep = 1;
-        statusText = 'Line: click end point (Esc to cancel)';
+        statusText = 'Line: click end point or type coordinates (Esc to cancel)';
       } else {
-        kernel.create_line(firstPoint!.x, firstPoint!.y, sx, sy, 'default');
+        kernel.create_line(firstPoint!.x, firstPoint!.y, pt.x, pt.y, 'default');
         syncView();
-        // Stay in line mode for continuous drawing
-        firstPoint = { x: sx, y: sy };
+        firstPoint = { x: pt.x, y: pt.y };
+        lastPoint = { x: pt.x, y: pt.y };
         statusText = 'Line: click next point (Esc to finish)';
       }
     } else if (currentTool === 'circle') {
       if (drawStep === 0) {
-        firstPoint = { x: sx, y: sy };
+        firstPoint = { x: pt.x, y: pt.y };
         drawStep = 1;
-        statusText = 'Circle: click edge point for radius (Esc to cancel)';
+        statusText = 'Circle: click edge point or type radius (Esc to cancel)';
       } else {
-        const dx = sx - firstPoint!.x;
-        const dy = sy - firstPoint!.y;
-        const radius = Math.sqrt(dx * dx + dy * dy);
-        if (radius > 0.01) {
-          kernel.create_circle(firstPoint!.x, firstPoint!.y, radius, 'default');
+        const r = Math.sqrt((pt.x - firstPoint!.x) ** 2 + (pt.y - firstPoint!.y) ** 2);
+        if (r > 0.01) {
+          kernel.create_circle(firstPoint!.x, firstPoint!.y, r, 'default');
+          lastPoint = { x: pt.x, y: pt.y };
           syncView();
         }
         drawStep = 0;
@@ -69,22 +102,155 @@
       }
     } else if (currentTool === 'rectangle') {
       if (drawStep === 0) {
-        firstPoint = { x: sx, y: sy };
+        firstPoint = { x: pt.x, y: pt.y };
         drawStep = 1;
         statusText = 'Rectangle: click opposite corner (Esc to cancel)';
       } else {
-        const x = Math.min(firstPoint!.x, sx);
-        const y = Math.min(firstPoint!.y, sy);
-        const w = Math.abs(sx - firstPoint!.x);
-        const h = Math.abs(sy - firstPoint!.y);
+        const x = Math.min(firstPoint!.x, pt.x);
+        const y = Math.min(firstPoint!.y, pt.y);
+        const w = Math.abs(pt.x - firstPoint!.x);
+        const h = Math.abs(pt.y - firstPoint!.y);
         if (w > 0.01 && h > 0.01) {
           kernel.create_rectangle(x, y, w, h, 'default');
+          lastPoint = { x: pt.x, y: pt.y };
           syncView();
         }
         drawStep = 0;
         firstPoint = null;
         statusText = 'Rectangle: click first corner';
       }
+    } else if (currentTool === 'arc') {
+      if (drawStep === 0) {
+        firstPoint = { x: pt.x, y: pt.y };
+        drawStep = 1;
+        statusText = 'Arc: click start point on arc (Esc to cancel)';
+      } else if (drawStep === 1) {
+        const r = Math.sqrt((pt.x - firstPoint!.x) ** 2 + (pt.y - firstPoint!.y) ** 2);
+        const startAngle = Math.atan2(pt.y - firstPoint!.y, pt.x - firstPoint!.x);
+        (firstPoint as any).radius = r;
+        (firstPoint as any).startAngle = startAngle;
+        drawStep = 2;
+        statusText = 'Arc: click end point on arc (Esc to cancel)';
+      } else {
+        const r = (firstPoint as any).radius;
+        const startAngle = (firstPoint as any).startAngle;
+        const endAngle = Math.atan2(pt.y - firstPoint!.y, pt.x - firstPoint!.x);
+        if (r > 0.01) {
+          kernel.create_arc(firstPoint!.x, firstPoint!.y, r, startAngle, endAngle, 'default');
+          lastPoint = { x: pt.x, y: pt.y };
+          syncView();
+        }
+        drawStep = 0;
+        firstPoint = null;
+        statusText = 'Arc: click center point';
+      }
+    } else if (currentTool === 'move') {
+      const ids = renderer.selectionManager.getSelectedIds();
+      if (ids.length === 0) {
+        statusText = 'Move: select entities first, then press M';
+        return;
+      }
+      if (drawStep === 0) {
+        firstPoint = { x: pt.x, y: pt.y };
+        drawStep = 1;
+        statusText = 'Move: click destination point';
+      } else {
+        const dx = pt.x - firstPoint!.x;
+        const dy = pt.y - firstPoint!.y;
+        for (const id of ids) {
+          kernel.move_entity(id, dx, dy);
+        }
+        syncView();
+        drawStep = 0;
+        firstPoint = null;
+        statusText = 'Move complete';
+        setTool('select');
+      }
+    } else if (currentTool === 'copy') {
+      const ids = renderer.selectionManager.getSelectedIds();
+      if (ids.length === 0) {
+        statusText = 'Copy: select entities first';
+        return;
+      }
+      if (drawStep === 0) {
+        firstPoint = { x: pt.x, y: pt.y };
+        drawStep = 1;
+        statusText = 'Copy: click destination point';
+      } else {
+        const dx = pt.x - firstPoint!.x;
+        const dy = pt.y - firstPoint!.y;
+        for (const id of ids) {
+          const newId = kernel.copy_entity(id);
+          if (newId) kernel.move_entity(newId, dx, dy);
+        }
+        syncView();
+        drawStep = 0;
+        firstPoint = null;
+        statusText = 'Copy complete';
+        setTool('select');
+      }
+    } else if (currentTool === 'rotate') {
+      const ids = renderer.selectionManager.getSelectedIds();
+      if (ids.length === 0) {
+        statusText = 'Rotate: select entities first';
+        return;
+      }
+      if (drawStep === 0) {
+        firstPoint = { x: pt.x, y: pt.y };
+        drawStep = 1;
+        statusText = 'Rotate: click to set angle (or type degrees)';
+      } else {
+        const angle = Math.atan2(pt.y - firstPoint!.y, pt.x - firstPoint!.x);
+        for (const id of ids) {
+          kernel.rotate_entity(id, firstPoint!.x, firstPoint!.y, angle);
+        }
+        syncView();
+        drawStep = 0;
+        firstPoint = null;
+        statusText = 'Rotate complete';
+        setTool('select');
+      }
+    }
+  }
+
+  function handleCursorMove(worldX: number, worldY: number) {
+    cursorX = worldX;
+    cursorY = worldY;
+
+    if (snapEnabled && renderer) {
+      const entities = renderer.getEntitiesForSnap();
+      const snap = renderer.snapEngine.findSnap(worldX, worldY, entities);
+      if (snap && snap.type !== 'grid') {
+        hasSnap = true;
+        snapX = snap.x;
+        snapY = snap.y;
+        snapType = snap.type;
+        renderer.setSnapIndicator(snap);
+      } else if (snap && snap.type === 'grid' && drawStep > 0) {
+        hasSnap = true;
+        snapX = snap.x;
+        snapY = snap.y;
+        snapType = 'grid';
+        renderer.setSnapIndicator(null);
+      } else {
+        hasSnap = false;
+        renderer.setSnapIndicator(null);
+      }
+    }
+
+    if (drawStep > 0 && firstPoint && renderer) {
+      const pt = getSnapOrCursor();
+      if (currentTool === 'line') {
+        renderer.setPreview('line', firstPoint, pt);
+      } else if (currentTool === 'circle') {
+        renderer.setPreview('circle', firstPoint, pt);
+      } else if (currentTool === 'rectangle') {
+        renderer.setPreview('rectangle', firstPoint, pt);
+      } else if (currentTool === 'move' || currentTool === 'copy') {
+        renderer.setPreview('move', firstPoint, pt);
+      }
+    } else if (renderer) {
+      renderer.clearPreview();
     }
   }
 
@@ -92,59 +258,161 @@
     currentTool = tool;
     drawStep = 0;
     firstPoint = null;
+    renderer?.clearPreview();
 
     const msgs: Record<Tool, string> = {
       select: 'Select: click to select entities',
       line: 'Line: click start point',
       circle: 'Circle: click center point',
       rectangle: 'Rectangle: click first corner',
+      arc: 'Arc: click center point',
+      move: 'Move: click base point',
+      copy: 'Copy: click base point',
+      rotate: 'Rotate: click center of rotation',
     };
     statusText = msgs[tool];
   }
 
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') {
-      drawStep = 0;
-      firstPoint = null;
-      statusText = `${currentTool}: operation cancelled`;
-    }
-    // Focus command line on any letter key when not focused
-    if (e.key === '/' && document.activeElement !== commandInput) {
-      e.preventDefault();
-      commandInput?.focus();
+  function doUndo() {
+    if (kernel?.can_undo()) {
+      kernel.undo();
+      syncView();
+      statusText = 'Undo';
     }
   }
 
+  function doRedo() {
+    if (kernel?.can_redo()) {
+      kernel.redo();
+      syncView();
+      statusText = 'Redo';
+    }
+  }
+
+  function doDelete() {
+    if (!kernel || !renderer) return;
+    const ids = renderer.selectionManager.getSelectedIds();
+    for (const id of ids) {
+      kernel.delete_entity(id);
+    }
+    renderer.selectionManager.clear();
+    selectedEntity = null;
+    syncView();
+    statusText = `Deleted ${ids.length} entities`;
+  }
+
+  function parseCoordinateInput(input: string): { x: number; y: number } | null {
+    const trimmed = input.trim();
+
+    const polarMatch = trimmed.match(/^@([\d.]+)<([\d.]+)$/);
+    if (polarMatch) {
+      const dist = parseFloat(polarMatch[1]);
+      const angleDeg = parseFloat(polarMatch[2]);
+      const angleRad = angleDeg * Math.PI / 180;
+      return {
+        x: lastPoint.x + dist * Math.cos(angleRad),
+        y: lastPoint.y + dist * Math.sin(angleRad),
+      };
+    }
+
+    const relMatch = trimmed.match(/^@([-\d.]+),([-\d.]+)$/);
+    if (relMatch) {
+      return {
+        x: lastPoint.x + parseFloat(relMatch[1]),
+        y: lastPoint.y + parseFloat(relMatch[2]),
+      };
+    }
+
+    const absMatch = trimmed.match(/^([-\d.]+),([-\d.]+)$/);
+    if (absMatch) {
+      return {
+        x: parseFloat(absMatch[1]),
+        y: parseFloat(absMatch[2]),
+      };
+    }
+
+    return null;
+  }
+
   function handleCommand() {
-    const cmd = commandText.trim().toLowerCase();
+    const cmd = commandText.trim();
     commandText = '';
 
-    if (cmd === 'l' || cmd === 'line') setTool('line');
-    else if (cmd === 'c' || cmd === 'circle') setTool('circle');
-    else if (cmd === 'r' || cmd === 'rect' || cmd === 'rectangle') setTool('rectangle');
-    else if (cmd === 'ze' || cmd === 'zoom extents') renderer?.zoomExtents();
-    else if (cmd === 'esc') { drawStep = 0; firstPoint = null; }
-    else statusText = `Unknown command: ${cmd}`;
+    if (!cmd) return;
+
+    const coordPoint = parseCoordinateInput(cmd);
+    if (coordPoint && drawStep > 0) {
+      handleClick(coordPoint.x, coordPoint.y);
+      return;
+    }
+
+    const lower = cmd.toLowerCase();
+    if (lower === 'l' || lower === 'line') setTool('line');
+    else if (lower === 'c' || lower === 'circle') setTool('circle');
+    else if (lower === 'r' || lower === 'rect' || lower === 'rectangle') setTool('rectangle');
+    else if (lower === 'a' || lower === 'arc') setTool('arc');
+    else if (lower === 'm' || lower === 'move') setTool('move');
+    else if (lower === 'co' || lower === 'copy') setTool('copy');
+    else if (lower === 'ro' || lower === 'rotate') setTool('rotate');
+    else if (lower === 'ze' || lower === 'zoom extents') renderer?.zoomExtents();
+    else if (lower === 'u' || lower === 'undo') doUndo();
+    else if (lower === 'redo') doRedo();
+    else if (lower === 'del' || lower === 'delete' || lower === 'erase') doDelete();
+    else if (lower === 'esc') { drawStep = 0; firstPoint = null; renderer?.clearPreview(); }
+    else if (coordPoint) {
+      setTool('line');
+      handleClick(coordPoint.x, coordPoint.y);
+    }
+    else statusText = `Unknown: ${cmd}`;
+  }
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (document.activeElement === commandInput) return;
+
+    if (e.key === 'Escape') {
+      if (drawStep > 0) {
+        drawStep = 0;
+        firstPoint = null;
+        renderer?.clearPreview();
+        statusText = 'Cancelled';
+      } else {
+        renderer?.selectionManager.clear();
+        selectedEntity = null;
+        renderer?.updateSelection();
+        renderer?.render();
+      }
+    }
+    else if (e.key === 'z' && (e.ctrlKey || e.metaKey) && e.shiftKey) { e.preventDefault(); doRedo(); }
+    else if (e.key === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doUndo(); }
+    else if (e.key === 'y' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doRedo(); }
+    else if (e.key === 'Delete' || e.key === 'Backspace') { doDelete(); }
+    else if (e.key === 'l') setTool('line');
+    else if (e.key === 'c') setTool('circle');
+    else if (e.key === 'r') setTool('rectangle');
+    else if (e.key === 'a') setTool('arc');
+    else if (e.key === 'm') setTool('move');
+    else if (e.key === 's') setTool('select');
+    else if (e.key === 'F2') { e.preventDefault(); renderer?.zoomExtents(); }
+    else if (e.key === '/') { e.preventDefault(); commandInput?.focus(); }
+  }
+
+  function handlePropertyUpdate(id: string, changes: any) {
+    // Future: update entity properties via kernel
   }
 
   onMount(async () => {
     try {
-      // Dynamic import for WASM
       const wasmModule = await import('@nexus/kernel');
       await wasmModule.default();
       kernel = new wasmModule.Kernel();
 
-      // Init renderer
       renderer = new CadRenderer(canvasContainer);
-      renderer.onCursorMove = (x: number, y: number) => {
-        cursorX = x;
-        cursorY = y;
-      };
+      renderer.onCursorMove = handleCursorMove;
       renderer.onClick = handleClick;
+      renderer.getCanvas().style.cursor = 'crosshair';
 
-      statusText = 'Ready — select a tool to begin drawing';
+      statusText = 'Ready — select a tool or press / for command line';
 
-      // Draw some demo geometry
       kernel.create_line(-10, -10, 10, -10, 'default');
       kernel.create_line(10, -10, 10, 10, 'default');
       kernel.create_line(10, 10, -10, 10, 'default');
@@ -152,7 +420,6 @@
       kernel.create_circle(0, 0, 5, 'default');
       syncView();
       renderer.zoomExtents();
-
     } catch (e) {
       statusText = `Init error: ${e}`;
       console.error(e);
@@ -167,26 +434,39 @@
 <div class="app">
   <header class="toolbar">
     <span class="logo">NEXUS</span>
-    <div class="tools">
-      <button class:active={currentTool === 'select'} onclick={() => setTool('select')} title="Select (S)">
-        ◇ Select
-      </button>
-      <button class:active={currentTool === 'line'} onclick={() => setTool('line')} title="Line (L)">
-        / Line
-      </button>
-      <button class:active={currentTool === 'circle'} onclick={() => setTool('circle')} title="Circle (C)">
-        O Circle
-      </button>
-      <button class:active={currentTool === 'rectangle'} onclick={() => setTool('rectangle')} title="Rectangle (R)">
-        [] Rect
-      </button>
+
+    <div class="tool-group">
+      <button class:active={currentTool === 'select'} onclick={() => setTool('select')} title="Select (S)">Select</button>
+      <span class="separator">|</span>
+      <button class:active={currentTool === 'line'} onclick={() => setTool('line')} title="Line (L)">Line</button>
+      <button class:active={currentTool === 'circle'} onclick={() => setTool('circle')} title="Circle (C)">Circle</button>
+      <button class:active={currentTool === 'rectangle'} onclick={() => setTool('rectangle')} title="Rectangle (R)">Rect</button>
+      <button class:active={currentTool === 'arc'} onclick={() => setTool('arc')} title="Arc (A)">Arc</button>
+      <span class="separator">|</span>
+      <button class:active={currentTool === 'move'} onclick={() => setTool('move')} title="Move (M)">Move</button>
+      <button class:active={currentTool === 'copy'} onclick={() => setTool('copy')} title="Copy (CO)">Copy</button>
+      <button class:active={currentTool === 'rotate'} onclick={() => setTool('rotate')} title="Rotate (RO)">Rotate</button>
+      <button onclick={doDelete} title="Delete (Del)">Delete</button>
     </div>
+
+    <span class="separator">|</span>
+
+    <button onclick={doUndo} disabled={!canUndo} title="Undo (Ctrl+Z)">&#8630;</button>
+    <button onclick={doRedo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)">&#8631;</button>
+
+    <span class="separator">|</span>
+
+    <button class:snap-on={snapEnabled} onclick={() => { snapEnabled = !snapEnabled; if (renderer) renderer.snapEngine.config.enabled = snapEnabled; }}>
+      Snap: {snapEnabled ? 'ON' : 'OFF'}
+    </button>
+
     <span class="spacer"></span>
     <span class="entity-count">{entityCount} entities</span>
   </header>
 
   <main class="workspace">
     <div class="canvas-container" bind:this={canvasContainer}></div>
+    <PropertiesPanel entity={selectedEntity} onUpdate={handlePropertyUpdate} />
   </main>
 
   <footer class="status-bar">
@@ -196,12 +476,17 @@
         bind:this={commandInput}
         bind:value={commandText}
         onkeydown={(e) => e.key === 'Enter' && handleCommand()}
-        placeholder="Type command (L=line, C=circle, R=rect, /=focus)"
+        placeholder="Command (/ to focus, L/C/R/A/M, @x,y, @d<angle)"
         spellcheck="false"
       />
     </div>
     <span class="status-text">{statusText}</span>
-    <span class="coordinates">{cursorX.toFixed(2)}, {cursorY.toFixed(2)}</span>
+    <div class="coordinates">
+      {#if hasSnap && snapType !== 'grid'}
+        <span class="snap-indicator">[{snapType}]</span>
+      {/if}
+      <span class="coord-value">{(hasSnap ? snapX : cursorX).toFixed(2)}, {(hasSnap ? snapY : cursorY).toFixed(2)}</span>
+    </div>
   </footer>
 </div>
 
@@ -217,11 +502,12 @@
   .toolbar {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    padding: 0 1rem;
+    gap: 4px;
+    padding: 0 12px;
     background: #16213e;
     border-bottom: 1px solid #0f3460;
     height: 44px;
+    flex-shrink: 0;
   }
 
   .logo {
@@ -229,75 +515,69 @@
     font-size: 1.1rem;
     color: #e94560;
     letter-spacing: 2px;
-    margin-right: 1rem;
+    margin-right: 12px;
   }
 
-  .tools {
+  .tool-group {
     display: flex;
-    gap: 4px;
+    align-items: center;
+    gap: 2px;
   }
 
-  .tools button {
+  .toolbar button {
     background: #1a1a2e;
     border: 1px solid #333;
     color: #ccc;
-    padding: 4px 12px;
-    border-radius: 4px;
+    padding: 4px 10px;
+    border-radius: 3px;
     cursor: pointer;
     font-family: inherit;
-    font-size: 0.8rem;
+    font-size: 0.78rem;
+    white-space: nowrap;
   }
 
-  .tools button:hover {
-    background: #2a2a4e;
-    border-color: #555;
-  }
+  .toolbar button:hover { background: #2a2a4e; border-color: #555; }
+  .toolbar button:active { background: #0f3460; }
+  .toolbar button.active, .toolbar button:global(.active) { background: #0f3460; border-color: #e94560; color: #fff; }
+  .toolbar button:disabled { opacity: 0.4; cursor: default; }
+  .toolbar button.snap-on { color: #00ff88; border-color: #00ff88; }
 
-  .tools button.active {
-    background: #0f3460;
-    border-color: #e94560;
-    color: #fff;
-  }
-
+  .separator { color: #333; margin: 0 4px; }
   .spacer { flex: 1; }
 
-  .entity-count {
-    font-size: 0.75rem;
-    color: #888;
-  }
+  .entity-count { font-size: 0.75rem; color: #666; }
 
   .workspace {
     flex: 1;
+    display: flex;
     overflow: hidden;
   }
 
   .canvas-container {
-    width: 100%;
-    height: 100%;
+    flex: 1;
+    position: relative;
   }
 
   .status-bar {
     display: flex;
     align-items: center;
-    gap: 1rem;
-    padding: 0 0.5rem;
+    gap: 12px;
+    padding: 0 8px;
     background: #16213e;
     border-top: 1px solid #0f3460;
     height: 32px;
     font-size: 0.75rem;
+    flex-shrink: 0;
   }
 
   .command-line {
     display: flex;
     align-items: center;
     gap: 4px;
-    flex: 0 0 300px;
+    flex: 0 0 320px;
   }
 
-  .prompt {
-    color: #e94560;
-    font-weight: bold;
-  }
+  .prompt { color: #e94560; font-weight: bold; }
 
   .command-line input {
     background: #1a1a2e;
@@ -311,9 +591,7 @@
     outline: none;
   }
 
-  .command-line input:focus {
-    border-color: #e94560;
-  }
+  .command-line input:focus { border-color: #e94560; }
 
   .status-text {
     flex: 1;
@@ -324,9 +602,20 @@
   }
 
   .coordinates {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 200px;
+    justify-content: flex-end;
+  }
+
+  .snap-indicator {
+    color: #ffaa00;
+    font-size: 0.7rem;
+  }
+
+  .coord-value {
     color: #00ff88;
     font-family: 'JetBrains Mono', monospace;
-    flex: 0 0 150px;
-    text-align: right;
   }
 </style>
